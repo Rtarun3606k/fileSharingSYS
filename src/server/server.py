@@ -109,6 +109,10 @@ class FileServer:
                 elif msg_type == protocol.FILE_REQUEST:
                     self.handle_file_request(client_socket, payload)
                 
+                elif msg_type == protocol.FILE_CHUNK_ACK:
+                    # Handle chunk acknowledgment (for future use)
+                    continue
+                
                 elif msg_type == protocol.FILE_UPLOAD_REQUEST:
                     self.handle_file_upload_request(client_socket, payload)
                 
@@ -175,13 +179,33 @@ class FileServer:
                 protocol.send_error_message(client_socket, f"File not found: {filename}")
                 return
             
-            # Read the file and encode it
-            with open(file_path, 'rb') as file:
-                file_data = base64.b64encode(file.read()).decode('utf-8')
+            # Get the file size
+            file_size = os.path.getsize(file_path)
+            total_chunks = (file_size // protocol.MAX_CHUNK_SIZE) + (1 if file_size % protocol.MAX_CHUNK_SIZE > 0 else 0)
             
-            # Send the file to the client
-            protocol.send_file_response(client_socket, filename, file_data)
-            print(f"Sent file: {filename}")
+            # Send file metadata first
+            protocol.send_file_response(client_socket, filename, file_size)
+            
+            # Send the file in chunks
+            with open(file_path, 'rb') as file:
+                chunk_id = 0
+                while True:
+                    data = file.read(protocol.MAX_CHUNK_SIZE)
+                    if not data:
+                        break
+                    
+                    # Encode the chunk data
+                    encoded_data = base64.b64encode(data).decode('utf-8')
+                    
+                    # Send the chunk
+                    protocol.send_file_chunk(client_socket, chunk_id, total_chunks, encoded_data)
+                    
+                    # Wait for acknowledgment (optional for now)
+                    chunk_id += 1
+            
+            # Signal that transfer is complete
+            protocol.send_transfer_complete(client_socket, True, filename)
+            print(f"Sent file: {filename} ({self.format_size(file_size)}) in {total_chunks} chunks")
         
         except Exception as e:
             print(f"Error handling file request: {e}")
@@ -208,13 +232,17 @@ class FileServer:
             file_path = os.path.join(self.storage_dir, filename)
             
             # Decode and write the file
-            decoded_data = base64.b64decode(file_data)
-            with open(file_path, 'wb') as file:
-                file.write(decoded_data)
-            
-            # Send a success response
-            protocol.send_file_upload_response(client_socket, True, f"File {filename} uploaded successfully")
-            print(f"Received file: {filename}")
+            try:
+                decoded_data = base64.b64decode(file_data)
+                with open(file_path, 'wb') as file:
+                    file.write(decoded_data)
+                
+                # Send a success response
+                protocol.send_file_upload_response(client_socket, True, f"File {filename} uploaded successfully")
+                print(f"Received file: {filename} ({self.format_size(len(decoded_data))})")
+            except Exception as e:
+                protocol.send_file_upload_response(client_socket, False, f"Error saving file: {str(e)}")
+                print(f"Error saving uploaded file: {e}")
         
         except Exception as e:
             print(f"Error handling file upload request: {e}")

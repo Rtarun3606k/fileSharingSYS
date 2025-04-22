@@ -1,8 +1,9 @@
 import os
 import sys
 import threading
+import time  # Added for the delay
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, TclError
 from pathlib import Path
 
 # Add parent directory to path for importing client module
@@ -114,6 +115,9 @@ class FileClientGUI:
             text=f"Download Directory: {self.client.download_dir}"
         )
         self.download_dir_label.pack(side="left", padx=5)
+        
+        # Keep track of active download dialogs
+        self.active_downloads = {}
     
     def toggle_connection(self):
         """
@@ -263,41 +267,163 @@ class FileClientGUI:
         if not self.client.connected:
             return
         
-        # Show a loading dialog
-        loading_dialog = ctk.CTkToplevel(self.root)
-        loading_dialog.title("Downloading...")
-        loading_dialog.geometry("300x100")
-        loading_dialog.transient(self.root)
-        loading_dialog.grab_set()
+        # Check if already downloading this file
+        if filename in self.active_downloads:
+            messagebox.showinfo("Info", f"Already downloading {filename}")
+            return
         
-        ctk.CTkLabel(loading_dialog, text=f"Downloading {filename}...").pack(pady=20)
+        # Create a custom save dialog
+        save_path = filedialog.asksaveasfilename(
+            title="Save file as",
+            initialdir=self.client.download_dir,
+            initialfile=filename,
+            defaultextension=".*"
+        )
+        
+        if not save_path:
+            return  # User cancelled
+        
+        # Create progress dialog
+        loading_dialog = ctk.CTkToplevel(self.root)
+        loading_dialog.title(f"Downloading {filename}")
+        loading_dialog.geometry("400x150")
+        loading_dialog.transient(self.root)
+        
+        # Force the dialog to be displayed right away
+        loading_dialog.update()
+        
+        # Add dialog elements
+        ctk.CTkLabel(loading_dialog, text=f"Downloading {filename}...").pack(pady=(20, 10))
+        
+        # Progress bar
+        progress_bar = ctk.CTkProgressBar(loading_dialog, width=350)
+        progress_bar.pack(pady=10)
+        progress_bar.set(0)
+        
+        # Status label
+        status_label = ctk.CTkLabel(loading_dialog, text="Initializing download...")
+        status_label.pack(pady=10)
+        
+        # Cancel button
+        cancel_btn = ctk.CTkButton(
+            loading_dialog,
+            text="Cancel",
+            command=lambda: self._cancel_download(filename)
+        )
+        cancel_btn.pack(pady=5)
+        
+        # Add to active downloads
+        self.active_downloads[filename] = {
+            "dialog": loading_dialog,
+            "progress_bar": progress_bar,
+            "status_label": status_label,
+            "cancelled": False
+        }
+        
+        # Progress callback function
+        def update_progress(progress):
+            if filename in self.active_downloads:
+                self.root.after(0, lambda: self._update_download_progress(filename, progress))
+        
+        # Try to bring the dialog to front
+        self._safe_grab_set(loading_dialog)
         
         # Start download in a separate thread
         threading.Thread(
             target=self._download_thread,
-            args=(filename, loading_dialog),
+            args=(filename, save_path, update_progress),
             daemon=True
         ).start()
     
-    def _download_thread(self, filename, loading_dialog):
+    def _safe_grab_set(self, dialog):
+        """
+        A simpler approach for handling dialog focus
+        Instead of trying to grab focus which is causing issues,
+        just focus the window and let the OS handle it
+        """
+        try:
+            # Bring window to front instead of using grab_set
+            dialog.lift()
+            dialog.focus_force()
+            print("Dialog focus set")
+        except Exception as e:
+            print(f"Could not set dialog focus: {e}")
+
+    def _update_download_progress(self, filename, progress):
+        """
+        Update the download progress UI.
+        
+        Args:
+            filename: Name of the file being downloaded
+            progress: Download progress as a percentage (0-100)
+        """
+        if filename not in self.active_downloads:
+            return
+        
+        download_info = self.active_downloads[filename]
+        progress_bar = download_info["progress_bar"]
+        status_label = download_info["status_label"]
+        
+        progress_bar.set(progress / 100)
+        status_label.configure(text=f"Downloading: {progress:.1f}%")
+    
+    def _cancel_download(self, filename):
+        """
+        Cancel an active download.
+        
+        Args:
+            filename: Name of the file being downloaded
+        """
+        if filename in self.active_downloads:
+            self.active_downloads[filename]["cancelled"] = True
+            self.active_downloads[filename]["dialog"].destroy()
+            del self.active_downloads[filename]
+    
+    def _download_thread(self, filename, save_path, progress_callback):
         """
         Download a file in a separate thread.
+        
+        Args:
+            filename: Name of the file to download
+            save_path: Path to save the file to
+            progress_callback: Callback function for progress updates
         """
-        success, message = self.client.download_file(filename)
+        success, message = self.client.download_file(filename, save_path, progress_callback)
+        
+        # Check if download was cancelled
+        if filename in self.active_downloads and self.active_downloads[filename]["cancelled"]:
+            # Cleanup any partial download
+            try:
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+            except:
+                pass
+            return
         
         # Update UI in the main thread
-        self.root.after(0, lambda: self._download_complete(success, message, loading_dialog))
+        self.root.after(0, lambda: self._download_complete(filename, success, message))
     
-    def _download_complete(self, success, message, loading_dialog):
+    def _download_complete(self, filename, success, message):
         """
         Handle download completion.
+        
+        Args:
+            filename: Name of the downloaded file
+            success: Whether the download was successful
+            message: Status message
         """
-        loading_dialog.destroy()
+        if filename in self.active_downloads:
+            self.active_downloads[filename]["dialog"].destroy()
+            del self.active_downloads[filename]
         
         if success:
             messagebox.showinfo("Success", message)
         else:
             messagebox.showerror("Error", message)
+            
+            # If connection was lost, update the UI
+            if not self.client.connected:
+                self.update_connection_state(False)
     
     def upload_file(self):
         """
@@ -312,14 +438,31 @@ class FileClientGUI:
         if not file_path:
             return  # User canceled
         
-        # Show a loading dialog
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        # If file is large, show a warning
+        if file_size > 100 * 1024 * 1024:  # 100 MB
+            if not messagebox.askyesno(
+                "Large File Warning",
+                f"The selected file is {self._format_size(file_size)} which is quite large. "
+                f"Uploading might take a long time and could fail. Continue?"
+            ):
+                return
+        
+        # Create a dialog (without custom name since CTkToplevel doesn't support 'name' parameter)
         loading_dialog = ctk.CTkToplevel(self.root)
         loading_dialog.title("Uploading...")
-        loading_dialog.geometry("300x100")
+        loading_dialog.geometry("350x100")
         loading_dialog.transient(self.root)
-        loading_dialog.grab_set()
         
         ctk.CTkLabel(loading_dialog, text=f"Uploading {os.path.basename(file_path)}...").pack(pady=20)
+        
+        # Wait for the dialog to be visible before grabbing focus
+        threading.Thread(
+            target=self._safe_grab_set, 
+            args=(loading_dialog,),
+            daemon=True
+        ).start()
         
         # Start upload in a separate thread
         threading.Thread(
@@ -331,6 +474,10 @@ class FileClientGUI:
     def _upload_thread(self, file_path, loading_dialog):
         """
         Upload a file in a separate thread.
+        
+        Args:
+            file_path: Path to the file to upload
+            loading_dialog: Loading dialog window
         """
         success, message = self.client.upload_file(file_path)
         
@@ -343,6 +490,11 @@ class FileClientGUI:
     def _upload_complete(self, success, message, loading_dialog):
         """
         Handle upload completion.
+        
+        Args:
+            success: Whether the upload was successful
+            message: Status message
+            loading_dialog: Loading dialog window
         """
         loading_dialog.destroy()
         
@@ -352,16 +504,40 @@ class FileClientGUI:
             self.refresh_file_list()
         else:
             messagebox.showerror("Error", message)
+            
+            # If connection was lost, update the UI
+            if not self.client.connected:
+                self.update_connection_state(False)
     
     def change_download_dir(self):
         """
         Change the download directory.
         """
-        new_dir = filedialog.askdirectory(title="Select Download Directory")
+        new_dir = filedialog.askdirectory(
+            title="Select Download Directory",
+            initialdir=self.client.download_dir
+        )
         
         if new_dir:
             self.client.download_dir = new_dir
             self.download_dir_label.configure(text=f"Download Directory: {self.client.download_dir}")
+    
+    @staticmethod
+    def _format_size(size):
+        """
+        Format a file size in bytes to a human-readable string.
+        
+        Args:
+            size: Size in bytes
+            
+        Returns:
+            Formatted size string
+        """
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024:
+                return f"{size:.2f} {unit}"
+            size /= 1024
+        return f"{size:.2f} PB"
 
 def main():
     root = ctk.CTk()
